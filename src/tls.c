@@ -119,7 +119,13 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
 
 int tls_conn_init(server_t *srv, connection_t *c) {
     mbedtls_ssl_init(&c->ssl);
-    if (mbedtls_ssl_setup(&c->ssl, &srv->ssl_conf) != 0) return -1;
+    if (mbedtls_ssl_setup(&c->ssl, &srv->ssl_conf) != 0) {
+        /* mbedtls_ssl_setup can allocate buffers internally before
+         * failing. Free them so we don't leak across many failed
+         * handshakes (e.g. under a TLS probe storm). */
+        mbedtls_ssl_free(&c->ssl);
+        return -1;
+    }
     mbedtls_ssl_set_bio(&c->ssl, c, bio_send, bio_recv, NULL);
     c->use_tls = 1;
     return 0;

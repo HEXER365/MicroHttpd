@@ -29,7 +29,9 @@ void conn_close(server_t *srv, connection_t *c) {
     close(c->fd);
     c->fd = -1;
     c->state = CONN_FREE;
-    c->rlen = c->rparsed = c->wlen = c->wsent = 0;
+    c->rlen = c->wlen = c->wsent = 0;
+    c->head_only = 0;
+    c->keep_alive = 0;
 }
 
 static void accept_all(server_t *srv) {
@@ -40,6 +42,8 @@ static void accept_all(server_t *srv) {
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             if (errno == EINTR) continue;
+            /* EMFILE/ENFILE: out of FDs. Don't busy-loop on accept;
+             * the next epoll wake-up will retry. */
             return;
         }
 
@@ -64,7 +68,12 @@ static void accept_all(server_t *srv) {
         uint32_t events = EPOLLIN | EPOLLET;
 #ifdef ENABLE_TLS
         if (srv->tls_enabled) {
-            if (tls_conn_init(srv, c) != 0) { close(fd); c->state = CONN_FREE; continue; }
+            if (tls_conn_init(srv, c) != 0) {
+                /* tls_conn_init already cleaned up its own partial state. */
+                close(fd);
+                c->state = CONN_FREE;
+                continue;
+            }
             c->state = CONN_TLS_HANDSHAKE;
             events = EPOLLIN | EPOLLOUT | EPOLLET;
         }
@@ -91,6 +100,7 @@ static void sweep_idle(server_t *srv) {
 int server_init(server_t *srv, const char *bind_addr, int port, const char *docroot) {
     memset(srv, 0, sizeof(*srv));
     srv->docroot = docroot;
+    srv->shutdown_requested = 0;
     for (int i = 0; i < MAX_CONNS; i++) srv->conns[i].file_fd = -1;
 
     signal(SIGPIPE, SIG_IGN);
@@ -126,15 +136,35 @@ int server_init(server_t *srv, const char *bind_addr, int port, const char *docr
 void server_run(server_t *srv) {
     struct epoll_event events[MAX_EVENTS];
     time_t last_sweep = time(NULL);
+    time_t shutdown_started = 0;
 
     for (;;) {
+        /* If a signal asked us to shut down, stop accepting new conns and
+         * let in-flight requests drain up to SHUTDOWN_GRACE_SEC. */
+        if (srv->shutdown_requested) {
+            if (shutdown_started == 0) {
+                shutdown_started = time(NULL);
+                /* Stop waking up on the listener; new conns are unwelcome. */
+                epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, srv->listen_fd, NULL);
+            }
+            int still_busy = 0;
+            for (int i = 0; i < MAX_CONNS; i++)
+                if (srv->conns[i].state != CONN_FREE) { still_busy = 1; break; }
+            if (!still_busy || time(NULL) - shutdown_started > SHUTDOWN_GRACE_SEC)
+                return;
+        }
+
         int n = epoll_wait(srv->epoll_fd, events, MAX_EVENTS, EVENT_LOOP_TICK_MS);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
         for (int i = 0; i < n; i++) {
-            if (events[i].data.ptr == NULL) { accept_all(srv); continue; }
+            if (events[i].data.ptr == NULL) {
+                /* Listener wake-up. Ignore during graceful shutdown. */
+                if (!srv->shutdown_requested) accept_all(srv);
+                continue;
+            }
             connection_t *c = (connection_t *)events[i].data.ptr;
             if (c->state == CONN_FREE) continue; /* stale event on a closed slot */
 
@@ -151,8 +181,8 @@ void server_run(server_t *srv) {
 void server_shutdown(server_t *srv) {
     for (int i = 0; i < MAX_CONNS; i++)
         if (srv->conns[i].state != CONN_FREE) conn_close(srv, &srv->conns[i]);
-    close(srv->listen_fd);
-    close(srv->epoll_fd);
+    if (srv->listen_fd >= 0) { close(srv->listen_fd); srv->listen_fd = -1; }
+    if (srv->epoll_fd >= 0)  { close(srv->epoll_fd);  srv->epoll_fd  = -1; }
 #ifdef ENABLE_TLS
     if (srv->tls_enabled) tls_server_free(srv);
 #endif

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -33,7 +34,6 @@ typedef struct {
     /* read side */
     char     rbuf[READ_BUF_SIZE];
     size_t   rlen;             /* bytes currently in rbuf     */
-    size_t   rparsed;          /* bytes already parsed        */
 
     /* write side (small responses / headers) */
     char     wbuf[WRITE_BUF_SIZE];
@@ -46,6 +46,7 @@ typedef struct {
     off_t    file_remaining;
 
     int      keep_alive;       /* client wants keep-alive     */
+    int      head_only;        /* HEAD: send headers, no body */
     time_t   last_active;
 
 #ifdef ENABLE_TLS
@@ -59,6 +60,11 @@ typedef struct {
     int          listen_fd;
     int          epoll_fd;
     const char  *docroot;
+
+    /* graceful shutdown: set by signal handler, polled in main loop.
+     * Volatile sig_atomic_t so it is safe to set from a signal handler
+     * and read from the main loop without a race. */
+    volatile sig_atomic_t shutdown_requested;
 
 #ifdef ENABLE_TLS
     int tls_enabled;

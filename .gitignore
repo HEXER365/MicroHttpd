@@ -1,0 +1,13 @@
+# Build artifacts
+microhttpd
+microhttpd-debug
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test certs generated locally
+certs/
+*.pem
