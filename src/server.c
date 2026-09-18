@@ -31,6 +31,7 @@ void conn_close(server_t *srv, connection_t *c) {
     c->state = CONN_FREE;
     c->rlen = c->wlen = c->wsent = 0;
     c->head_only = 0;
+    c->sent_100 = 0;
     c->keep_alive = 0;
 }
 
