@@ -47,6 +47,7 @@ typedef struct {
 
     int      keep_alive;       /* client wants keep-alive     */
     int      head_only;        /* HEAD: send headers, no body */
+    int      sent_100;         /* 100-continue already sent for current request */
     time_t   last_active;
 
 #ifdef ENABLE_TLS

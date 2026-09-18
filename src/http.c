@@ -485,21 +485,29 @@ static void process_request(server_t *srv, connection_t *c) {
         if ((size_t)content_length > sizeof(c->rbuf) - total_hdr_bytes) {
             send_simple(srv, c, 413, "413 Payload Too Large\n");
             c->keep_alive = 0;
+            return;
+        }
+        /* If the client sent Expect: 100-continue, acknowledge it NOW
+         * before waiting for the body. This must sit above the early
+         * return: when headers arrive first body_have is 0, so the old
+         * position below the return was unreachable dead code. Flush
+         * the 25 interim bytes synchronously so they are not buffered
+         * behind (and clobbered by) the final response headers. */
+        if (expect_continue && !c->sent_100) {
+            static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+            size_t cont_len = sizeof(cont) - 1;
+            size_t off = 0;
+            while (off < cont_len) {
+                ssize_t n = conn_write(c, cont + off, cont_len - off);
+                if (n > 0) { off += (size_t)n; continue; }
+                if (n < 0 && errno == EINTR) continue;
+                break; /* EAGAIN or error: client waiting means the
+                        * window is almost surely open, so the loop
+                        * above normally sends all 25 bytes at once. */
+            }
+            if (off == cont_len) c->sent_100 = 1;
         }
         return;
-    }
-
-    /* If the client sent Expect: 100-continue and we haven't seen the
-     * body yet, tell it to go ahead. We send the literal "HTTP/1.1 100
-     * Continue\r\n\r\n" inline without disturbing the keep-alive state —
-     * the real response follows once we actually dispatch. */
-    if (expect_continue && content_length > 0 && body_have == 0) {
-        static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
-        size_t cl = sizeof(cont) - 1;
-        if (c->wlen + cl <= sizeof(c->wbuf)) {
-            memcpy(c->wbuf + c->wlen, cont, cl);
-            c->wlen += cl;
-        }
     }
 
     /* url-decode the URI in place. uri came from sscanf with a width
@@ -530,6 +538,9 @@ static void process_request(server_t *srv, connection_t *c) {
     size_t leftover = c->rlen - consumed;
     route(srv, c, &req);
 
+    /* Current request is dispatched; the next pipelined request on this
+     * connection starts with a fresh Expect state. */
+    c->sent_100 = 0;
     if (leftover > 0) memmove(c->rbuf, c->rbuf + consumed, leftover);
     c->rlen = leftover;
 }
@@ -680,6 +691,7 @@ finish_response:
     c->state = CONN_READING_REQ;
     c->wlen = c->wsent = 0;
     c->head_only = 0;
+    c->sent_100 = 0;
     set_epoll(srv, c, EPOLLIN | EPOLLET);
     /* pipelined leftover bytes already sit in rbuf; give them a pass now */
     if (c->rlen > 0) process_request(srv, c);
